@@ -1,41 +1,27 @@
 #!/usr/bin/env python3
+
 import argparse
 import csv
 import json
 import logging
-import os
+import re
 import struct
 import sys
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Tuple, Dict, List, Optional, Any
-from collections import defaultdict
-import re
+from typing import Any, Dict, List, Tuple
 
-# Attempt to import Capstone for disassembly
 try:
     from capstone import Cs, CS_ARCH_ARM, CS_MODE_ARM, CS_MODE_THUMB
     CAPSTONE_AVAILABLE = True
 except ImportError:
     CAPSTONE_AVAILABLE = False
-    print("Warning: Capstone not installed. Disassembly unavailable. Install with: pip install capstone")
 
-# Setup logging
-LOG_DIR = Path.home() / '.mtk_bootloader_analysis' / 'logs'
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / f"mtk_bootloader_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler(LOG_FILE, encoding='utf-8')
-    ]
-)
+# Global logging configuration
+LOG_DIR = None
 logger = logging.getLogger(__name__)
 
-# Configuration class for constants
 class Config:
     """Configuration for bootloader analysis."""
     EMMC_VENDORS = {
@@ -44,35 +30,67 @@ class Config:
         b'\x90\x01\x4A': 'Hynix',
         b'\x45\x01\x00': 'Sandisk',
         b'\xFE\x01\x4A': 'Micron',
+        b'\x03\x00\x44': 'Unknown Vendor (0x030044)',  # Added from log data
     }
     PATTERNS = {
         'MTK_BLOADER_INFO': b'MTK_BLOADER_INFO',
         'MTK_BIN': b'MTK_BIN',
         'ARM_CODE_NOP': b'\x00\xF0\x20\xE3',
         'STRING': lambda x: len(x) > 4 and all(32 <= c < 127 for c in x),
-        'POTENTIAL_PTR': lambda x: len(x) == 4 and 0x1000 <= int.from_bytes(x, 'little') <= 0x1FFFFF,
+        'POTENTIAL_PTR': lambda x, file_size: len(x) == 4 and 0x1000 <= int.from_bytes(x, 'little') < file_size,
     }
     ELEMENT_SIZE = 188
     HEADER_SIZE = 112
     MAX_DRAM_SIZE_MB = 16384
     MIN_FILE_SIZE = 128
+    MAX_CODE_SECTION_SIZE = 4096
 
 def decode_bytes(data: bytes) -> str:
-    """Decode bytes to ASCII string or return hex if not printable.
+    """Decode bytes to string, replacing non-printable characters.
 
     Args:
         data: Bytes to decode.
 
     Returns:
-        Decoded ASCII string or hex representation.
+        Decoded string with non-printable characters replaced.
     """
-    try:
-        ascii_str = data.split(b'\x00')[0].decode('ascii', errors='ignore').strip()
-        if ascii_str and all(c.isprintable() for c in ascii_str):
-            return ascii_str
-        return data.hex().upper()
-    except UnicodeDecodeError:
-        return data.hex().upper()
+    return ''.join(chr(b) if 32 <= b < 127 else '.' for b in data).strip('.')
+
+def interpret_emi_cona_val(emi_cona_val: int) -> Dict[str, Any]:
+    """Interpret EMI_CONA register value.
+
+    Args:
+        emi_cona_val: EMI_CONA register value.
+
+    Returns:
+        Dictionary with dual rank, bus width, and burst settings.
+    """
+    dual_rank = bool(emi_cona_val & 0x80000000)
+    bus_width = 16 if emi_cona_val & 0x00000004 else 32
+    burst_enabled = bool(emi_cona_val & 0x00000001)
+    return {
+        'dual_rank': dual_rank,
+        'bus_width': bus_width,
+        'burst_enabled': burst_enabled
+    }
+
+def interpret_dram_rank_size(rank_sizes: Tuple[int, ...]) -> List[str]:
+    """Interpret DRAM rank sizes into logical units.
+
+    Args:
+        rank_sizes: Tuple of DRAM rank sizes in bytes.
+
+    Returns:
+        List of formatted size strings (e.g., "1 GB", "512 MB", "Disabled").
+    """
+    sizes = []
+    for size in rank_sizes:
+        if size == 0:
+            sizes.append("Disabled")
+        else:
+            mb = size // (1024 * 1024)
+            sizes.append(f"{mb // 1024} GB" if mb >= 1024 else f"{mb} MB")
+    return sizes
 
 def decode_emmc_id(emmc_id: bytes, emmc_id_len: int) -> Dict[str, Any]:
     """Decode eMMC ID with manufacturer info and additional details.
@@ -85,20 +103,18 @@ def decode_emmc_id(emmc_id: bytes, emmc_id_len: int) -> Dict[str, Any]:
         Dictionary with vendor, model, raw data, and details.
     """
     if not 0 <= emmc_id_len <= 16:
-        return {
-            'vendor': 'Not Available',
-            'model': '',
-            'raw': emmc_id.hex().upper(),
-            'details': {'error': f'Invalid length: {emmc_id_len}'}
-        }
+        logger.warning(f"Invalid eMMC ID length {emmc_id_len}, treating as 0")
+        emmc_id_len = 0
     
     vendor_prefix = emmc_id[:3]
-    vendor = Config.EMMC_VENDORS.get(vendor_prefix, 'Unknown')
-    model_bytes = emmc_id[3:emmc_id_len]
+    vendor = Config.EMMC_VENDORS.get(vendor_prefix, f'Unknown (0x{vendor_prefix.hex().upper()})')
+    model_bytes = emmc_id[3:emmc_id_len] if emmc_id_len > 0 else b''
     model_str = model_bytes.decode('ascii', errors='ignore').strip()
-    model = model_str if all(c.isprintable() for c in model_str) else model_bytes.hex().upper()
+    model = model_str if all(c.isprintable() for c in model_str) and model_str else model_bytes.hex().upper()
     
     details = {}
+    if vendor.startswith('Unknown') and emmc_id_len > 0 and any(emmc_id[:emmc_id_len]):
+        details['possible_id'] = decode_bytes(emmc_id[:emmc_id_len])
     if vendor != 'Unknown' and len(model_bytes) >= 2:
         details['revision'] = model_bytes[-2:].hex().upper()
         details['capacity_hint'] = 'Unknown'
@@ -106,122 +122,41 @@ def decode_emmc_id(emmc_id: bytes, emmc_id_len: int) -> Dict[str, Any]:
     return {
         'vendor': vendor,
         'model': model,
-        'raw': emmc_id[:max(emmc_id_len, 16)].hex().upper(),
+        'raw': emmc_id[:16].hex().upper(),
         'details': details
     }
 
-def interpret_dram_rank_size(rank_sizes: Tuple[int, ...]) -> List[str]:
-    """Interpret DRAM rank sizes into logical units.
-
-    Args:
-        rank_sizes: Tuple of DRAM rank sizes in bytes.
-
-    Returns:
-        List of formatted size strings (e.g., "1 GB", "512 MB").
-    """
-    sizes = []
-    for size in rank_sizes:
-        if size == 0:
-            sizes.append("0 MB")
-        else:
-            mb = size // (1024 * 1024)
-            sizes.append(f"{mb // 1024} GB" if mb >= 1024 else f"{mb} MB")
-    return sizes
-
-def decode_dram_settings(element: Dict) -> Dict[str, Any]:
-    """Decode DRAM settings with detailed timing and configuration analysis.
-
-    Args:
-        element: Dictionary containing element data.
-
-    Returns:
-        Dictionary with EMI and ACTIM settings.
-    """
-    emi_cona = element['emi_cona_val']
-    actim = element['dramc_actim_val']
-    
-    emi_settings = {
-        'dual_rank': bool(emi_cona & (1 << 17)),
-        'bus_width': 16 if emi_cona & (1 << 2) else 32,
-        'burst_mode': 'Enabled' if emi_cona & (1 << 0) else 'Disabled',
-        'raw_value': f"0x{emi_cona:08X}"
-    }
-    
-    actim_settings = {
-        'raw_value': f"0x{actim:08X}",
-        'possible_frequency': 'Unknown'
-    }
-    trfc = (actim >> 24) & 0xFF
-    if 0x10 <= trfc <= 0x50:
-        freq_est = round(1600 / (trfc / 16), 1)
-        actim_settings['possible_frequency'] = f"~{freq_est} MHz"
-    
-    return {
-        'emi_cona': emi_settings,
-        'actim': actim_settings,
-        'additional_regs': {
-            'drvctl0': f"0x{element['dramc_drvctl0_val']:08X}",
-            'drvctl1': f"0x{element['dramc_drvctl1_val']:08X}",
-            'conf1': f"0x{element['dramc_conf1_val']:08X}"
-        }
-    }
-
-def decode_reserved(reserved: bytes, file_size: int) -> Dict[str, Any]:
-    """Decode reserved field with advanced analysis and size checking.
+def decode_reserved(reserved: bytes) -> Dict[str, Any]:
+    """Decode reserved field for strings or pointers.
 
     Args:
         reserved: Reserved field bytes.
-        file_size: Total file size for pointer validation.
 
     Returns:
-        Dictionary with analysis of reserved field.
+        Dictionary with analysis results.
     """
-    decoded = {
-        'hex': reserved.hex().upper(),
-        'ints': [],
-        'text': reserved.decode('ascii', errors='ignore').strip(),
-        'potential_pointers': [],
-        'potential_structures': [],
-        'entropy': sum(reserved.count(b) for b in set(reserved)) / len(reserved) if reserved else 0
+    analysis = {
+        'strings': [s.decode('ascii') for s in re.findall(b'[\x20-\x7e]{5,}', reserved)],
+        'pointers': [],
+        'insights': []
     }
-    
-    if len(reserved) != 40:
-        logger.warning(f"Reserved field size mismatch ({len(reserved)} bytes), expected 40 bytes")
-        reserved_padded = reserved + b'\x00' * (40 - len(reserved)) if len(reserved) < 40 else reserved[:40]
+    for i in range(0, len(reserved) - 3, 4):
+        val = struct.unpack_from('<I', reserved, i)[0]
+        if 0x1000 <= val < 0x1FFFFF:
+            analysis['pointers'].append(f"0x{val:08X}")
+    if len(set(reserved)) < 5:
+        analysis['insights'].append("Low variety: Possible repeating pattern or table")
+    elif len(set(reserved)) > 20:
+        analysis['insights'].append("High entropy: Possible encrypted data")
     else:
-        reserved_padded = reserved
-    
-    try:
-        decoded['ints'] = list(struct.unpack('<10I', reserved_padded))
-    except struct.error as e:
-        logger.error(f"Failed to unpack reserved field: {e}")
-        decoded['ints'] = []
-    
-    for i in range(0, len(reserved_padded) - 3, 4):
-        val = struct.unpack_from('<I', reserved_padded, i)[0]
-        if 0x1000 <= val < file_size:
-            decoded['potential_pointers'].append(f"0x{val:08X} at offset {i}")
-    
-    unique_bytes = len(set(reserved))
-    if unique_bytes > 10 and decoded['entropy'] > 0.9:
-        decoded['potential_structures'].append("High entropy: Possible encrypted data")
-    elif unique_bytes < 5 and any(reserved):
-        decoded['potential_structures'].append("Low variety: Possible repeating pattern or table")
-    
-    decoded['interpreted'] = (
-        'Possible string or identifier' if decoded['text'] and len(decoded['text']) > 4 else
-        'Possible memory pointers' if decoded['potential_pointers'] else
-        'Possible data structure or encrypted' if decoded['potential_structures'] else
-        'No clear interpretation'
-    )
-    
-    return decoded
+        analysis['insights'].append("Possible string or identifier")
+    return analysis
 
-def disassemble_code(data: bytes, offset: int, max_instructions: int = 30) -> Dict[str, Any]:
-    """Disassemble ARM code with function detection and insights.
+def disassemble_code(data: bytes, offset: int, max_instructions: int = 10) -> Dict[str, Any]:
+    """Disassemble code section with ARM and Thumb mode attempts.
 
     Args:
-        data: Bytes to disassemble.
+        data: Data to disassemble.
         offset: Starting offset for disassembly.
         max_instructions: Maximum number of instructions to disassemble.
 
@@ -234,88 +169,62 @@ def disassemble_code(data: bytes, offset: int, max_instructions: int = 30) -> Di
             'functions': [],
             'insights': []
         }
-    
+    if len(data) < 4 or offset % 4 != 0:
+        return {
+            'instructions': ["Invalid alignment or insufficient data for disassembly"],
+            'functions': [],
+            'insights': []
+        }
     try:
         modes = [(CS_MODE_ARM, "ARM"), (CS_MODE_THUMB, "Thumb")]
-        result = {'instructions': [], 'functions': [], 'insights': []}
-        
+        best_result = {'instructions': [], 'functions': [], 'insights': [], 'valid_count': 0}
+        file_size = len(data) + offset  # Approximate file size for pointer validation
         for mode, mode_name in modes:
             md = Cs(CS_ARCH_ARM, mode)
             instructions = []
             func_starts = []
             branch_targets = set()
-            
+            valid_count = 0
             for i, (address, size, mnemonic, op_str) in enumerate(md.disasm_lite(data, offset)):
                 if i >= max_instructions:
                     instructions.append("... (more instructions available)")
                     break
+                if mnemonic != 'andeq' or op_str != 'r0, r0, r0':
+                    valid_count += 1
                 instr = f"0x{address:08X}: {mnemonic} {op_str}"
                 instructions.append(instr)
-                
                 if i == 0 and mnemonic in ('push', 'stmfd', 'sub sp'):
                     func_starts.append(f"0x{address:08X} ({mode_name})")
-                
                 if mnemonic.startswith('b') and op_str.startswith('0x'):
                     try:
                         target = int(op_str, 16)
-                        branch_targets.add(target)
+                        if 0x1000 <= target < file_size:
+                            branch_targets.add(target)
                     except ValueError:
                         pass
-            
-            if instructions:
-                result['instructions'] = instructions
-                result['functions'] = func_starts
+            if valid_count > best_result['valid_count']:
+                best_result = {
+                    'instructions': instructions,
+                    'functions': func_starts,
+                    'insights': [f"Disassembled in {mode_name} mode"],
+                    'valid_count': valid_count
+                }
                 if branch_targets:
-                    result['functions'].extend(f"0x{t:08X} ({mode_name})" for t in branch_targets if t >= offset)
-                    result['insights'].append(f"Branch targets detected: {', '.join(f'0x{t:08X}' for t in branch_targets)}")
+                    best_result['functions'].extend(f"0x{t:08X} ({mode_name})" for t in branch_targets)
+                    best_result['insights'].append(f"Branch targets detected: {', '.join(f'0x{t:08X}' for t in branch_targets)}")
                 if func_starts:
-                    result['insights'].append(f"Potential function entry in {mode_name} mode at {func_starts[0]}")
-                break
-        
-        if not result['instructions']:
-            result['instructions'] = ["No valid instructions found"]
-        elif len(result['instructions']) > 10:
-            result['insights'].append("Significant code section detected. Review for bootloader logic.")
-        
-        return result
+                    best_result['insights'].append(f"Potential function entry in {mode_name} mode at {func_starts[0]}")
+        if not best_result['instructions']:
+            best_result['instructions'] = ["No valid instructions found"]
+        elif best_result['valid_count'] >= 5:
+            best_result['insights'].append("Significant code section detected. Review for bootloader logic.")
+        return best_result
     except Exception as e:
         return {
             'instructions': [f"Disassembly error: {e}"],
             'functions': [],
             'insights': []
         }
-
-def extract_section(data: bytes, start: int, size: int, output_dir: Path, name: str, analyze: bool = False, file_size: int = 0) -> Dict[str, Any]:
-    """Extract a data section to a file with optional analysis.
-
-    Args:
-        data: Full data buffer.
-        start: Start offset of the section.
-        size: Size of the section.
-        output_dir: Directory to save the extracted file.
-        name: Name of the section.
-        analyze: Whether to analyze the section (e.g., for strings or code).
-        file_size: Total file size for validation.
-
-    Returns:
-        Dictionary with section metadata and analysis.
-    """
-    if start + size > len(data):
-        logger.warning(f"Section {name} at 0x{start:X} exceeds file size, truncating to {len(data) - start} bytes")
-        size = len(data) - start
-    
-    section = data[start:start + size]
-    output_path = output_dir / f"{name}_{start:08X}_{size}.bin"
-    with output_path.open('wb') as f:
-        f.write(section)
-    logger.info(f"Extracted section '{name}' at 0x{start:X} (size: {size} bytes) to {output_path}")
-    
-    analysis = {'path': str(output_path), 'size': size}
-    if analyze and size > 4:
-        analysis['strings'] = [s for s in re.findall(b'[\x20-\x7e]{5,}', section)]
-        analysis.update(disassemble_code(section, start))
-        analysis['reserved'] = {}
-    return analysis
 
 def validate_element(element: Dict, offset: int, file_size: int) -> List[str]:
     """Validate element data with improved context.
@@ -329,13 +238,22 @@ def validate_element(element: Dict, offset: int, file_size: int) -> List[str]:
         List of warning messages for invalid fields.
     """
     warnings = []
-    if not 0 <= element['emmc_id_len'] <= 16:
-        warnings.append(f"Invalid eMMC ID length at offset 0x{offset:X}: {element['emmc_id_len']} (expected 0-16)")
-    if not 0 <= element['fw_id_len'] <= 8:
-        warnings.append(f"Invalid firmware ID length at offset 0x{offset:X}: {element['fw_id_len']} (expected 0-8)")
+    if 'raw_data' in element:
+        return [f"Element at offset 0x{offset:X} is corrupted or unparsed"]
+    
+    emmc_id_len = min(element['emmc_id_len'], 16) if 0 <= element['emmc_id_len'] <= 16 else 0
+    fw_id_len = min(element['fw_id_len'], 8) if 0 <= element['fw_id_len'] <= 8 else 0
+    
+    if element['emmc_id_len'] != emmc_id_len:
+        warnings.append(f"Invalid eMMC ID length at offset 0x{offset:X}: {element['emmc_id_len']} (capped at {emmc_id_len})")
+    if element['fw_id_len'] != fw_id_len:
+        warnings.append(f"Invalid firmware ID length at offset 0x{offset:X}: {element['fw_id_len']} (capped at {fw_id_len})")
+    
     total_mb = sum(size // (1024 * 1024) for size in element['dram_rank_size'])
     if total_mb > Config.MAX_DRAM_SIZE_MB:
         warnings.append(f"Unrealistic total DRAM size at offset 0x{offset:X}: {total_mb} MB")
+    if total_mb == 0 and element['emi_cona_val'] == 0 and element['dramc_actim_val'] == 0:
+        warnings.append(f"Element at offset 0x{offset:X} appears empty or disabled")
     if element['type'] not in (0x203, 0) and not (0x100 <= element['type'] <= 0xFFFF):
         warnings.append(f"Unusual memory type at offset 0x{offset:X}: 0x{element['type']:X}")
     if any(element['reserved']) and len(set(element['reserved'])) < 5:
@@ -360,7 +278,14 @@ def read_element(data: bytes, offset: int, file_size: int) -> Tuple[int, Dict]:
         cur_pos = offset
         element = {'_offset': offset}
         fields = struct.unpack_from('<4I', data, cur_pos)
-        element['sub_version'], element['type'], element['emmc_id_len'], element['fw_id_len'] = fields
+        element['sub_version'], element['type'], emmc_id_len, fw_id_len = fields
+        
+        # Cap invalid lengths
+        element['emmc_id_len'] = min(max(emmc_id_len, 0), 16)
+        element['fw_id_len'] = min(max(fw_id_len, 0), 8)
+        if emmc_id_len != element['emmc_id_len'] or fw_id_len != element['fw_id_len']:
+            logger.warning(f"Capped invalid lengths at offset 0x{offset:X}: eMMC={emmc_id_len} to {element['emmc_id_len']}, FW={fw_id_len} to {element['fw_id_len']}")
+        
         cur_pos += 16
         element['emmc_id'] = data[cur_pos:cur_pos+16]
         cur_pos += 16
@@ -382,168 +307,52 @@ def read_element(data: bytes, offset: int, file_size: int) -> Tuple[int, Dict]:
         element['lpddr3_mode_reg5'], element['lpddr3_mode_reg10'], element['lpddr3_mode_reg63'] = lpddr3_regs
         cur_pos += 24
         
-        if all(v == 0 for v in element['dram_rank_size']) and element['emi_cona_val'] == 0 and element['dramc_actim_val'] == 0:
-            logger.warning(f"Possible corrupted or empty element at offset 0x{offset:X}")
+        # Early detection of empty or corrupted element
+        if all(v == 0 for v in element['dram_rank_size'] + (element['emi_cona_val'], element['dramc_actim_val'])):
+            logger.warning(f"Empty or disabled element at offset 0x{offset:X}")
+            element['status'] = 'Empty or Disabled'
         
         return cur_pos, element
     except (struct.error, ValueError) as e:
         logger.error(f"Failed to parse element at offset 0x{offset:X}: {e}")
-        element = {'_offset': offset, 'raw_data': data[offset:min(offset + Config.ELEMENT_SIZE, len(data))].hex().upper()}
+        element = {'_offset': offset, 'raw_data': data[offset:min(offset + Config.ELEMENT_SIZE, len(data))].hex().upper(), 'status': 'Corrupted'}
         return offset + Config.ELEMENT_SIZE, element
 
-def print_element(element: Dict, print_type: str, csv_writer: Optional[csv.writer] = None, summary: bool = False, file_size: int = 0) -> Dict[str, Any]:
-    """Print or save element data with enhanced analysis.
+def extract_section(data: bytes, start: int, size: int, output_dir: Path, name: str, analyze: bool = False, file_size: int = 0) -> Dict[str, Any]:
+    """Extract a data section to a file with optional analysis.
 
     Args:
-        element: Element dictionary to print or save.
-        print_type: Output format ('normal' or 'excel').
-        csv_writer: CSV writer object for excel output.
-        summary: Whether to print a concise summary.
-        file_size: Total file size for analysis.
+        data: Full data buffer.
+        start: Start offset of the section.
+        size: Size of the section.
+        output_dir: Directory to save the extracted file.
+        name: Name of the section.
+        analyze: Whether to analyze the section (e.g., for strings or code).
+        file_size: Total file size for validation.
 
     Returns:
-        Dictionary with element analysis.
+        Dictionary with section metadata and analysis.
     """
-    if 'raw_data' in element:
-        analysis = {
-            'offset': f"0x{element['_offset']:X}",
-            'status': 'Corrupted or unparsed',
-            'raw_data': element['raw_data'],
-            'recommendations': ["Investigate raw data for alternate structure"]
-        }
-        if not summary:
-            print(f"Offset: {analysis['offset']}")
-            print(f"Status: {analysis['status']}")
-            print(f"Raw Data: {analysis['raw_data']}")
-            print(f"Recommendations: {', '.join(analysis['recommendations'])}")
-        return analysis
+    if size <= 0:
+        logger.warning(f"Skipping section {name} at 0x{start:X} with invalid size {size}")
+        return {'path': None, 'size': 0, 'status': 'Invalid Size'}
     
-    emmc_info = decode_emmc_id(element['emmc_id'], element['emmc_id_len'])
-    fw_id_str = decode_bytes(element['fw_id'][:min(element['fw_id_len'], 8)]) if element['fw_id_len'] > 0 else f"Raw: {element['fw_id'].hex().upper()}"
-    dram_rank_sizes = interpret_dram_rank_size(element['dram_rank_size'])
-    reserved_info = decode_reserved(element['reserved'], file_size)
-    dram_settings = decode_dram_settings(element)
+    if start + size > len(data):
+        logger.warning(f"Section {name} at 0x{start:X} exceeds file size, truncating to {len(data) - start} bytes")
+        size = len(data) - start
     
-    total_dram_mb = sum(int(s.split()[0]) * (1024 if 'GB' in s else 1) for s in dram_rank_sizes)
+    section = data[start:start + size]
+    output_path = output_dir / f"{name}_{start:08X}_{size}.bin"
+    with output_path.open('wb') as f:
+        f.write(section)
+    logger.info(f"Extracted section '{name}' at 0x{start:X} (size: {size} bytes) to {output_path}")
     
-    analysis = {
-        'offset': f"0x{element['_offset']:X}",
-        'emmc': emmc_info,
-        'fw_id': fw_id_str,
-        'dram_rank_sizes': dram_rank_sizes,
-        'total_dram_size_mb': total_dram_mb,
-        'dram_settings': dram_settings,
-        'memory_type': 'LPDDR3' if element['type'] == 0x203 else f"Unknown (0x{element['type']:X})",
-        'reserved_non_zero': any(element['reserved']),
-        'reserved_info': reserved_info,
-        'recommendations': []
-    }
-    
-    if total_dram_mb > Config.MAX_DRAM_SIZE_MB:
-        analysis['recommendations'].append("Unrealistic DRAM size detected. Verify units or corruption.")
-    if reserved_info['potential_pointers']:
-        analysis['recommendations'].append("Potential pointers found in reserved field. Cross-reference with file offsets.")
-    if reserved_info['potential_structures']:
-        analysis['recommendations'].append(f"Possible structure in reserved field: {reserved_info['potential_structures'][0]}")
-    if total_dram_mb == 0 and any(element['dram_rank_size']) == 0 and element['emi_cona_val'] == 0:
-        analysis['recommendations'].append("Element appears empty or corrupted. Verify data integrity.")
-    
-    if summary:
-        print(f"Element at offset {analysis['offset']}:")
-        print(f"  eMMC: {emmc_info['vendor']} {emmc_info['model']} (Rev: {emmc_info['details'].get('revision', 'N/A')})")
-        print(f"  DRAM: {', '.join(dram_rank_sizes)} (Total: {total_dram_mb} MB)")
-        print(f"  Type: {analysis['memory_type']}")
-        print(f"  DRAM Settings: Dual Rank={dram_settings['emi_cona']['dual_rank']}, Bus Width={dram_settings['emi_cona']['bus_width']} bits, Freq={dram_settings['actim']['possible_frequency']}")
-        return analysis
-    
-    if print_type == 'excel':
-        row = [
-            analysis['memory_type'],
-            f"{emmc_info['vendor']} {emmc_info['model']}",
-            fw_id_str,
-            "",
-            dram_settings['emi_cona']['raw_value'],
-            dram_settings['additional_regs']['drvctl0'],
-            dram_settings['additional_regs']['drvctl1'],
-            dram_settings['actim']['raw_value'],
-            f"0x{element['dramc_gddr3ctl1_val']:08X}",
-            dram_settings['additional_regs']['conf1'],
-            f"0x{element['dramc_ddr2ctl_val']:08X}",
-            f"0x{element['dramc_test2_3_val']:08X}",
-            f"0x{element['dramc_conf2_val']:08X}",
-            f"0x{element['dramc_pd_ctrl_val']:08X}",
-            f"0x{element['dramc_padctl3_val']:08X}",
-            f"0x{element['dramc_dqodly_val']:08X}",
-            f"0x{element['dramc_addr_output_dly']:08X}",
-            f"0x{element['dramc_clk_output_dly']:08X}",
-            f"0x{element['dramc_actim1_val']:08X}",
-            f"0x{element['dramc_misctl0_val']:08X}",
-            f"0x{element['dramc_actim05t_val']:08X}",
-            analysis['memory_type'],
-            f"0x{element['lpddr3_mode_reg1']:08X}",
-            f"0x{element['lpddr3_mode_reg2']:08X}",
-            f"0x{element['lpddr3_mode_reg3']:08X}",
-            f"0x{element['lpddr3_mode_reg5']:08X}",
-            f"0x{element['lpddr3_mode_reg10']:08X}",
-            f"0x{element['lpddr3_mode_reg63']:08X}",
-            ", ".join(dram_rank_sizes),
-            reserved_info['hex'],
-            ", ".join(f"0x{x:08X}" for x in reserved_info['ints']) if reserved_info['ints'] else "",
-            str(dram_settings['emi_cona']['dual_rank']),
-            str(dram_settings['emi_cona']['bus_width']),
-            dram_settings['actim']['possible_frequency'],
-            ", ".join(reserved_info['potential_pointers']) if reserved_info['potential_pointers'] else "None"
-        ]
-        if csv_writer:
-            csv_writer.writerow(row)
-        return analysis
-    
-    lines = [
-        f"Offset: {analysis['offset']}",
-        f"Type: {analysis['memory_type']}",
-        f"eMMC ID: {emmc_info['vendor']} {emmc_info['model']} (Raw: {emmc_info['raw']}, Rev: {emmc_info['details'].get('revision', 'N/A')})",
-        f"Firmware ID: {fw_id_str}",
-        f"EMI_CONA_VAL: {dram_settings['emi_cona']['raw_value']} (Dual Rank: {dram_settings['emi_cona']['dual_rank']}, Bus Width: {dram_settings['emi_cona']['bus_width']} bits, Burst: {dram_settings['emi_cona']['burst_mode']})",
-        f"DRAMC_ACTIM_VAL: {dram_settings['actim']['raw_value']} (Est. Freq: {dram_settings['actim']['possible_frequency']})",
-        f"DRAM Rank Size: {', '.join(dram_rank_sizes)} (Total: {total_dram_mb} MB)",
-        f"Reserved: {reserved_info['hex']}",
-        f"Reserved Analysis: {reserved_info['interpreted']}",
-        f"Reserved Pointers: {', '.join(reserved_info['potential_pointers']) if reserved_info['potential_pointers'] else 'None'}",
-        f"Recommendations: {', '.join(analysis['recommendations']) if analysis['recommendations'] else 'None'}"
-    ]
-    for line in lines:
-        print(line)
+    analysis = {'path': str(output_path), 'size': size}
+    if analyze and size > 4:
+        analysis['strings'] = [s for s in re.findall(b'[\x20-\x7e]{5,}', section)]
+        analysis.update(disassemble_code(section, start, max_instructions=10))
+        analysis['reserved'] = {}
     return analysis
-
-def generate_flash_tool_config(elements: List[Dict], output_dir: Path) -> None:
-    """Generate an SP Flash Tool memory config file.
-
-    Args:
-        elements: List of element analysis dictionaries.
-        output_dir: Directory to save the config file.
-    """
-    config = [
-        "# SP Flash Tool Memory Configuration",
-        f"# Generated by MTK Bootloader Analysis ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})",
-        ""
-    ]
-    for i, element in enumerate(elements):
-        if 'raw_data' in element:
-            config.append(f"# Element {i} at offset {element['offset']} (Corrupted)")
-            config.append(f"RAW_DATA: {element['raw_data']}")
-            continue
-        config.append(f"# Element {i} at offset {element['offset']}")
-        config.append(f"EMMC_ID: {element['emmc']['raw']}")
-        config.append(f"DRAM_TYPE: {element['memory_type']}")
-        config.append(f"DRAM_RANK_SIZE: {', '.join(element['dram_rank_sizes'])}")
-        config.append(f"EMI_CONA_VAL: {element['dram_settings']['emi_cona']['raw_value']}")
-        config.append(f"ACTIM_VAL: {element['dram_settings']['actim']['raw_value']} (Freq: {element['dram_settings']['actim']['possible_frequency']})")
-        config.append("")
-    
-    config_path = output_dir / "flash_tool_memory_config.txt"
-    with config_path.open('w', encoding='utf-8') as f:
-        f.write("\n".join(config))
-    logger.info(f"Generated SP Flash Tool config at {config_path}")
 
 def analyze_remaining_data(data: bytes, start: int, output_dir: Path, file_size: int, max_size: int = 1024*1024) -> Dict[str, Any]:
     """Analyze remaining data for strings, code, and pointers.
@@ -572,14 +381,14 @@ def analyze_remaining_data(data: bytes, start: int, output_dir: Path, file_size:
         'entropy': sum(data.count(b) for b in set(data)) / len(data) if data else 0
     }
     
-    # String detection using regex for efficiency
+    # String detection
     analysis['strings'] = [f"0x{start + m.start():X}: {m.group().decode('ascii')}"
                           for m in re.finditer(b'[\x20-\x7e]{5,}', data)]
     
     # Pointer detection
     for i in range(0, len(data) - 3, 4):
         val = struct.unpack_from('<I', data, i)[0]
-        if 0x1000 <= val < file_size:
+        if Config.PATTERNS['POTENTIAL_PTR'](data[i:i+4], file_size):
             analysis['pointers'].append(f"0x{start + i:X}: 0x{val:08X}")
     
     # Code detection
@@ -588,15 +397,35 @@ def analyze_remaining_data(data: bytes, start: int, output_dir: Path, file_size:
         code_start = None
         instructions = []
         for i in range(0, len(data) - 3, 4):
+            if i + 4 > len(data):
+                break
             chunk = data[i:i+4]
+            if (i + start) % 4 != 0:  # Ensure 4-byte alignment
+                continue
             disasm_result = list(md.disasm(chunk, start + i))
-            if disasm_result:
+            if disasm_result and not all(ins.mnemonic == 'andeq' and ins.op_str == 'r0, r0, r0' for ins in disasm_result):
                 if code_start is None:
                     code_start = start + i
                 instructions.extend(f"0x{a:08X}: {m} {o}" for a, s, m, o in md.disasm_lite(chunk, start + i))
             elif code_start is not None and instructions:
-                section_size = i - (code_start - start)
-                disasm_analysis = disassemble_code(data[code_start - start:code_start - start + section_size], code_start)
+                section_size = min(i - (code_start - start), Config.MAX_CODE_SECTION_SIZE)
+                if section_size > 0:
+                    disasm_analysis = disassemble_code(data[code_start - start:code_start - start + section_size], code_start, max_instructions=10)
+                    analysis['code_sections'].append({
+                        'offset': f"0x{code_start:X}",
+                        'size': section_size,
+                        'instructions': disasm_analysis['instructions'][:10],
+                        'functions': disasm_analysis['functions'],
+                        'insights': disasm_analysis['insights']
+                    })
+                    extract_section(data[code_start - start:code_start - start + section_size], code_start, section_size, output_dir, "CODE_SECTION", analyze=False, file_size=file_size)
+                code_start = None
+                instructions = []
+        
+        if instructions and code_start is not None:
+            section_size = min(len(data) - (code_start - start), Config.MAX_CODE_SECTION_SIZE)
+            if section_size > 0:
+                disasm_analysis = disassemble_code(data[code_start - start:code_start - start + section_size], code_start, max_instructions=10)
                 analysis['code_sections'].append({
                     'offset': f"0x{code_start:X}",
                     'size': section_size,
@@ -604,21 +433,7 @@ def analyze_remaining_data(data: bytes, start: int, output_dir: Path, file_size:
                     'functions': disasm_analysis['functions'],
                     'insights': disasm_analysis['insights']
                 })
-                extract_section(data[code_start - start:i], code_start, section_size, output_dir, "CODE_SECTION", analyze=False, file_size=file_size)
-                code_start = None
-                instructions = []
-        
-        if instructions and code_start is not None:
-            section_size = len(data) - (code_start - start)
-            disasm_analysis = disassemble_code(data[code_start - start:], code_start)
-            analysis['code_sections'].append({
-                'offset': f"0x{code_start:X}",
-                'size': section_size,
-                'instructions': disasm_analysis['instructions'][:10],
-                'functions': disasm_analysis['functions'],
-                'insights': disasm_analysis['insights']
-            })
-            extract_section(data[code_start - start:], code_start, section_size, output_dir, "CODE_SECTION", analyze=False, file_size=file_size)
+                extract_section(data[code_start - start:code_start - start + section_size], code_start, section_size, output_dir, "CODE_SECTION", analyze=False, file_size=file_size)
     
     if analysis['entropy'] > 0.9:
         analysis['insights'].append("High entropy detected: Possible encrypted or compressed section")
@@ -629,73 +444,240 @@ def analyze_remaining_data(data: bytes, start: int, output_dir: Path, file_size:
     
     return analysis
 
-def export_markdown(result: Dict, output_dir: Path) -> None:
-    """Export detailed analysis to Markdown.
+def generate_flash_tool_config(elements: List[Dict], output_dir: Path) -> None:
+    """Generate SP Flash Tool configuration file.
+
+    Args:
+        elements: List of parsed elements.
+        output_dir: Directory to save the configuration file.
+    """
+    config_path = output_dir / "flash_tool_memory_config.txt"
+    with config_path.open('w', encoding='utf-8') as f:
+        f.write("# SP Flash Tool Memory Configuration\n")
+        f.write("# Generated by MTK Bootloader Analysis\n\n")
+        for i, element in enumerate(elements):
+            if element.get('status') in ('Corrupted', 'Empty or Disabled'):
+                continue
+            f.write(f"# Element {i} at offset {element['offset']}\n")
+            f.write(f"eMMC Vendor: {element['emmc']['vendor']}\n")
+            f.write(f"eMMC Model: {element['emmc']['model']}\n")
+            f.write(f"Memory Type: {element['memory_type']}\n")
+            f.write(f"DRAM Ranks: {', '.join(element['dram_rank_size'])} (Total: {element['total_dram_size_mb']} MB)\n")
+            f.write(f"Dual Rank: {element['emi_cona']['dual_rank']}\n")
+            f.write(f"Bus Width: {element['emi_cona']['bus_width']} bits\n")
+            f.write(f"Burst Enabled: {element['emi_cona']['burst_enabled']}\n")
+            f.write(f"Estimated Frequency: {element['estimated_frequency']}\n")
+            f.write(f"EMI_CONA: 0x{element['emi_cona_val']:08X}\n")
+            f.write(f"DRAMC_ACTIM: 0x{element['dramc_actim_val']:08X}\n")
+            f.write("\n")
+    logger.info(f"Generated SP Flash Tool config at {config_path}")
+
+def export_markdown(result: Dict[str, Any], output_dir: Path) -> None:
+    """Export analysis result to a Markdown file.
 
     Args:
         result: Analysis result dictionary.
         output_dir: Directory to save the Markdown file.
     """
-    md_lines = [
-        "# MTK Bootloader Analysis",
-        f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"**File Size**: {result.get('file_size', 'Unknown')} bytes",
-        "",
-        "## Header",
-        f"- **Name**: {result['header']['header']}",
-        f"- **Version**: {result['header']['version']}",
-        f"- **File**: {result['header']['pre_bin']}",
-        f"- **Model**: {result['header']['model']}",
-        "",
-        "## Elements",
-    ]
-    for i, elem in enumerate(result['elements']):
-        md_lines.append(f"### Element {i} ({elem['offset']})")
-        if 'raw_data' in elem:
-            md_lines.append(f"- **Status**: {elem['status']}")
-            md_lines.append(f"- **Raw Data**: `{elem['raw_data']}`")
-        else:
-            md_lines.append(f"- **eMMC**: {elem['emmc']['vendor']} {elem['emmc']['model']} ({elem['emmc']['raw']})")
-            md_lines.append(f"- **DRAM**: {', '.join(elem['dram_rank_sizes'])} (Total: {elem['total_dram_size_mb']} MB)")
-            md_lines.append(f"- **Type**: {elem['memory_type']}")
-            md_lines.append(f"- **Frequency**: {elem['dram_settings']['actim']['possible_frequency']}")
-            md_lines.append(f"- **Reserved**: `{elem['reserved_info']['hex']}`")
-            md_lines.append(f"- **Reserved Analysis**: {elem['reserved_info']['interpreted']}")
-        md_lines.append("")
-    
-    md_lines.append("## Remaining Data")
-    for section in result['additional_sections']:
-        if 'code_sections' in section:
-            for cs in section['code_sections']:
-                md_lines.append(f"- **Code Section at {cs['offset']}** (Size: {cs['size']} bytes)")
-                md_lines.append("  ```")
-                md_lines.extend(f"  {instr}" for instr in cs['instructions'])
-                md_lines.append("  ```")
-                if cs['functions']:
-                    md_lines.append(f"  - **Functions**: {', '.join(cs['functions'])}")
-    
-    md_lines.append("## Recommendations")
-    for rec in result['analysis']['recommendations']:
-        md_lines.append(f"- {rec}")
-    
-    md_path = output_dir / "analysis_report.md"
+    md_path = output_dir / "analysis.md"
     with md_path.open('w', encoding='utf-8') as f:
-        f.write("\n".join(md_lines))
-    logger.info(f"Exported Markdown report to {md_path}")
+        f.write("# MediaTek Bootloader Analysis\n\n")
+        f.write(f"**File Size**: {result['file_size']} bytes\n\n")
+        f.write("## Header\n")
+        for key, value in result['header'].items():
+            if key.startswith('_'):
+                continue
+            f.write(f"- **{key.replace('_', ' ').title()}**: {value}\n")
+        
+        f.write("\n## Elements\n")
+        for i, element in enumerate(result['elements']):
+            if element.get('status') in ('Corrupted', 'Empty or Disabled'):
+                f.write(f"\n### Element {i} ({element.get('status')})\n")
+                f.write(f"- **Offset**: {element['offset']}\n")
+                if 'raw_data' in element:
+                    f.write(f"- **Raw Data**: {element['raw_data']}\n")
+                continue
+            f.write(f"\n### Element {i}\n")
+            f.write(f"- **Offset**: {element['offset']}\n")
+            f.write(f"- **Type**: {element['memory_type']}\n")
+            f.write(f"- **eMMC ID**: {element['emmc']['vendor']} (Raw: {element['emmc']['raw']}, Rev: {element['emmc']['details'].get('revision', 'N/A')})\n")
+            f.write(f"- **Firmware ID**: {element['firmware_id']}\n")
+            f.write(f"- **EMI_CONA_VAL**: 0x{element['emi_cona_val']:08X} (Dual Rank: {element['emi_cona']['dual_rank']}, Bus Width: {element['emi_cona']['bus_width']} bits, Burst: {'Enabled' if element['emi_cona']['burst_enabled'] else 'Disabled'})\n")
+            f.write(f"- **DRAMC_ACTIM_VAL**: 0x{element['dramc_actim_val']:08X} (Est. Freq: {element['estimated_frequency']})\n")
+            f.write(f"- **DRAM Rank Size**: {', '.join(element['dram_rank_size'])} (Total: {element['total_dram_size_mb']} MB)\n")
+            if element['reserved']['strings'] or element['reserved']['pointers']:
+                f.write(f"- **Reserved**: {element['reserved']['insights'][0] if element['reserved']['insights'] else 'None'}\n")
+                if element['reserved']['strings']:
+                    f.write("  - **Strings**: " + ", ".join(element['reserved']['strings']) + "\n")
+                if element['reserved']['pointers']:
+                    f.write("  - **Pointers**: " + ", ".join(element['reserved']['pointers']) + "\n")
+            f.write(f"- **Recommendations**: {', '.join(element['recommendations'])}\n")
+        
+        f.write("\n## Analysis Summary\n")
+        f.write(f"- **Supported eMMC Vendors**: {', '.join(result['analysis']['emmc_vendors'])}\n")
+        f.write(f"- **Memory Types**: {', '.join(result['analysis']['memory_types'])}\n")
+        f.write(f"- **Total Elements**: {result['analysis']['total_elements']}\n")
+        f.write(f"- **Valid Elements**: {result['analysis']['valid_elements']}\n")
+        f.write(f"- **Empty or Disabled Elements**: {result['analysis']['empty_elements']}\n")
+        f.write(f"- **Corrupted Elements**: {result['analysis']['corrupted_elements']}\n")
+        f.write("\n### DRAM Size Distribution\n")
+        for size, count in sorted(result['analysis']['dram_size_distribution'].items()):
+            unit = "MB" if size < 1024 else "GB"
+            display_size = size if unit == "MB" else size // 1024
+            f.write(f"- {display_size} {unit}: {'*' * count} ({count} elements)\n")
+        
+        f.write("\n### Extracted Sections\n")
+        for section in result['additional_sections']:
+            if 'path' in section and section['path']:
+                f.write(f"- {Path(section['path']).relative_to(output_dir)} ({section['size']} bytes)\n")
+            if 'strings' in section and section['strings']:
+                f.write("  - **Strings**:\n")
+                for s in section['strings']:
+                    f.write(f"    - {s}\n")
+            if 'code_sections' in section and section['code_sections']:
+                f.write("  - **Code Sections**:\n")
+                for cs in section['code_sections']:
+                    f.write(f"    - Offset: {cs['offset']}, Size: {cs['size']} bytes\n")
+                    for instr in cs['instructions']:
+                        f.write(f"      - {instr}\n")
+                    if cs['functions']:
+                        f.write(f"      - Potential Functions: {', '.join(cs['functions'])}\n")
+                    if cs['insights']:
+                        f.write(f"      - Insights: {', '.join(cs['insights'])}\n")
+            if 'pointers' in section and section['pointers']:
+                f.write("  - **Pointers**:\n")
+                for p in section['pointers']:
+                    f.write(f"    - {p}\n")
+        
+        f.write("\n## Recommendations\n")
+        for rec in result['analysis']['recommendations']:
+            f.write(f"- {rec}\n")
+    logger.info(f"Markdown analysis saved to {md_path}")
+
+def print_element(element: Dict, print_type: str, csv_writer: Any, summary: bool, file_size: int) -> Dict[str, Any]:
+    """Print or log element details.
+
+    Args:
+        element: Element dictionary to print.
+        print_type: Output format ('normal', 'excel').
+        csv_writer: CSV writer object for Excel output.
+        summary: Whether to print only a summary.
+        file_size: Total file size for validation.
+
+    Returns:
+        Dictionary with formatted element details.
+    """
+    if 'raw_data' in element:
+        return {
+            'offset': f"0x{element['_offset']:X}",
+            'status': element.get('status', 'Corrupted'),
+            'raw_data': element['raw_data']
+        }
+    
+    emmc = decode_emmc_id(element['emmc_id'], element['emmc_id_len'])
+    emi_cona = interpret_emi_cona_val(element['emi_cona_val'])
+    dram_rank_size = interpret_dram_rank_size(element['dram_rank_size'])
+    total_dram_size_mb = sum(size // (1024 * 1024) for size in element['dram_rank_size'])
+    reserved = decode_reserved(element['reserved'])
+    memory_type = 'LPDDR3' if element['type'] == 0x203 else f"Unknown (0x{element['type']:X})"
+    estimated_freq = 'Unknown'  # Placeholder; can be enhanced with actual frequency calculation
+    fw_id_str = decode_bytes(element['fw_id'][:element['fw_id_len']]) if element['fw_id_len'] > 0 else element['fw_id'][:element['fw_id_len']].hex().upper()
+    
+    recommendations = []
+    if total_dram_size_mb == 0 and element['emi_cona_val'] == 0:
+        recommendations.append("Element appears empty or corrupted. Verify data integrity.")
+    if reserved['pointers']:
+        recommendations.append("Potential pointers found in reserved field. Cross-reference with file offsets.")
+    if reserved['insights']:
+        recommendations.append(f"Possible structure in reserved field: {reserved['insights'][0]}")
+    
+    result = {
+        'offset': f"0x{element['_offset']:X}",
+        'memory_type': memory_type,
+        'emmc': emmc,
+        'firmware_id': fw_id_str,
+        'emi_cona_val': element['emi_cona_val'],
+        'emi_cona': emi_cona,
+        'dramc_actim_val': element['dramc_actim_val'],
+        'estimated_frequency': estimated_freq,
+        'dram_rank_size': dram_rank_size,
+        'total_dram_size_mb': total_dram_size_mb,
+        'reserved': reserved,
+        'reserved_non_zero': any(element['reserved']),
+        'recommendations': recommendations
+    }
+    
+    if summary:
+        return result
+    
+    if print_type == 'excel' and csv_writer:
+        csv_writer.writerow([
+            memory_type,
+            f"{emmc['vendor']} ({emmc['raw']})",
+            fw_id_str,
+            'N/A',  # NAND page size (placeholder)
+            f"0x{element['emi_cona_val']:08X}",
+            f"0x{element['dramc_drvctl0_val']:08X}",
+            f"0x{element['dramc_drvctl1_val']:08X}",
+            f"0x{element['dramc_actim_val']:08X}",
+            f"0x{element['dramc_gddr3ctl1_val']:08X}",
+            f"0x{element['dramc_conf1_val']:08X}",
+            f"0x{element['dramc_ddr2ctl_val']:08X}",
+            f"0x{element['dramc_test2_3_val']:08X}",
+            f"0x{element['dramc_conf2_val']:08X}",
+            f"0x{element['dramc_pd_ctrl_val']:08X}",
+            f"0x{element['dramc_padctl3_val']:08X}",
+            f"0x{element['dramc_dqodly_val']:08X}",
+            f"0x{element['dramc_addr_output_dly']:08X}",
+            f"0x{element['dramc_clk_output_dly']:08X}",
+            f"0x{element['dramc_actim1_val']:08X}",
+            f"0x{element['dramc_misctl0_val']:08X}",
+            f"0x{element['dramc_actim05t_val']:08X}",
+            memory_type,
+            f"0x{element['lpddr3_mode_reg1']:08X}",
+            f"0x{element['lpddr3_mode_reg2']:08X}",
+            f"0x{element['lpddr3_mode_reg3']:08X}",
+            f"0x{element['lpddr3_mode_reg5']:08X}",
+            f"0x{element['lpddr3_mode_reg10']:08X}",
+            f"0x{element['lpddr3_mode_reg63']:08X}",
+            ", ".join(dram_rank_size),
+            element['reserved'].hex().upper(),
+            ", ".join(f"0x{x:08X}" for x in struct.unpack('<10I', element['reserved'])),
+            str(emi_cona['dual_rank']),
+            str(emi_cona['bus_width']),
+            estimated_freq,
+            ", ".join(reserved['pointers'])
+        ])
+    else:
+        print(f"Offset: 0x{element['_offset']:X}")
+        print(f"Type: {memory_type}")
+        print(f"eMMC ID: {emmc['vendor']}  (Raw: {emmc['raw']}, Rev: {emmc['details'].get('revision', 'N/A')})")
+        print(f"Firmware ID: {fw_id_str}")
+        print(f"EMI_CONA_VAL: 0x{element['emi_cona_val']:08X} (Dual Rank: {emi_cona['dual_rank']}, Bus Width: {emi_cona['bus_width']} bits, Burst: {'Enabled' if emi_cona['burst_enabled'] else 'Disabled'})")
+        print(f"DRAMC_ACTIM_VAL: 0x{element['dramc_actim_val']:08X} (Est. Freq: {estimated_freq})")
+        print(f"DRAM Rank Size: {', '.join(dram_rank_size)} (Total: {total_dram_size_mb} MB)")
+        print(f"Reserved: {element['reserved'].hex().upper()}")
+        print(f"Reserved Analysis: {reserved['insights'][0] if reserved['insights'] else 'None'}")
+        if reserved['pointers']:
+            print(f"Reserved Pointers: {', '.join(reserved['pointers'])}")
+        for rec in recommendations:
+            print(f"Recommendations: {rec}")
+    
+    return result
 
 def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = False, summary: bool = False, markdown: bool = False) -> Dict[str, Any]:
-    """Parse the entire preloader file with maximum extraction.
+    """Parse bootloader file and extract information.
 
     Args:
         data: Bootloader file data.
-        print_type: Output format ('normal' or 'excel').
-        output_dir: Directory to save extracted files and outputs.
-        json_output: Whether to save analysis as JSON.
-        summary: Whether to print a concise summary.
-        markdown: Whether to export analysis as Markdown.
+        print_type: Output format ('normal', 'excel').
+        output_dir: Directory to save extracted files.
+        json_output: Whether to save JSON output.
+        summary: Whether to print only a summary.
+        markdown: Whether to export Markdown output.
 
     Returns:
-        Dictionary with complete analysis results.
+        Dictionary with analysis results.
     """
     file_size = len(data)
     if file_size < Config.MIN_FILE_SIZE:
@@ -711,6 +693,9 @@ def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = Fa
             'emmc_vendors': set(),
             'memory_types': set(),
             'total_elements': 0,
+            'valid_elements': 0,
+            'empty_elements': 0,
+            'corrupted_elements': 0,
             'recommendations': [],
             'patterns_found': defaultdict(list),
             'dram_size_distribution': {}
@@ -731,8 +716,8 @@ def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = Fa
                 result['additional_sections'].append(extract_section(data, pos, len(pattern), output_dir, name, file_size=file_size))
         elif callable(pattern):
             for i in range(0, len(data) - 16, 4):
-                chunk = data[i:i+16]
-                if pattern(chunk):
+                chunk = data[i:i+4]
+                if pattern(chunk, file_size):
                     result['analysis']['patterns_found'][name].append(f"0x{i:X}")
     
     # Header parsing
@@ -822,7 +807,15 @@ def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = Fa
         warnings = validate_element(element, start_pos, file_size)
         for w in warnings:
             logger.warning(w)
-        element_analysis = print_element(element, print_type, csv_writer, summary, file_size)
+        if element.get('status') in ('Corrupted', 'Empty or Disabled'):
+            result['analysis']['corrupted_elements' if element.get('status') == 'Corrupted' else 'empty_elements'] += 1
+            if not json_output and not summary and logger.getEffectiveLevel() <= logging.DEBUG:
+                element_analysis = print_element(element, print_type, csv_writer, summary, file_size)
+            else:
+                element_analysis = {'offset': f"0x{start_pos:X}", 'status': element.get('status'), 'raw_data': element.get('raw_data', '')}
+        else:
+            result['analysis']['valid_elements'] += 1
+            element_analysis = print_element(element, print_type, csv_writer, summary, file_size)
         result['elements'].append(element_analysis)
         
         if 'raw_data' not in element_analysis:
@@ -858,19 +851,23 @@ def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = Fa
         csv_file.close()
         logger.info(f"CSV output saved to {csv_path}")
     
-    generate_flash_tool_config(result['elements'], output_dir)
+    generate_flash_tool_config([e for e in result['elements'] if e.get('status') not in ('Corrupted', 'Empty or Disabled')], output_dir)
     
     if len(result['analysis']['emmc_vendors']) > 1:
         result['analysis']['recommendations'].append(
             f"Supports {len(result['analysis']['emmc_vendors'])} eMMC vendors: {', '.join(result['analysis']['emmc_vendors'])}. Verify storage compatibility."
         )
-    if any(e.get('reserved_non_zero', False) for e in result['elements']):
+    if any(e.get('reserved_non_zero', False) for e in result['elements'] if e.get('status') not in ('Corrupted', 'Empty or Disabled')):
         result['analysis']['recommendations'].append(
             "Non-zero data in reserved fields. Analyze extracted files for potential firmware data."
         )
-    if any('Corrupted' in e.get('status', '') for e in result['elements']):
+    if result['analysis']['corrupted_elements'] > 0:
         result['analysis']['recommendations'].append(
-            "Corrupted elements detected. File may be damaged or use an alternate structure."
+            f"{result['analysis']['corrupted_elements']} corrupted elements detected. File may be damaged or use an alternate structure."
+        )
+    if result['analysis']['empty_elements'] > 0:
+        result['analysis']['recommendations'].append(
+            f"{result['analysis']['empty_elements']} empty or disabled elements detected. May indicate unused configurations."
         )
     
     if not json_output and not summary:
@@ -878,12 +875,17 @@ def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = Fa
         print(f"Supported eMMC Vendors: {', '.join(result['analysis']['emmc_vendors'])}")
         print(f"Memory Types: {', '.join(result['analysis']['memory_types'])}")
         print(f"Total Elements: {result['analysis']['total_elements']}")
+        print(f"Valid Elements: {result['analysis']['valid_elements']}")
+        print(f"Empty or Disabled Elements: {result['analysis']['empty_elements']}")
+        print(f"Corrupted Elements: {result['analysis']['corrupted_elements']}")
         print(f"DRAM Size Distribution:")
-        for size, count in result['analysis']['dram_size_distribution'].items():
-            print(f"  {size} MB: {'*' * count} ({count} elements)")
+        for size, count in sorted(result['analysis']['dram_size_distribution'].items()):
+            unit = "MB" if size < 1024 else "GB"
+            display_size = size if unit == "MB" else size // 1024
+            print(f"  {display_size} {unit}: {'*' * count} ({count} elements)")
         for section in result['additional_sections']:
-            if 'path' in section:
-                print(f"Extracted Section: {section['path']} ({section['size']} bytes)")
+            if 'path' in section and section['path']:
+                print(f"Extracted Section: {Path(section['path']).relative_to(output_dir)} ({section['size']} bytes)")
             if 'strings' in section and section['strings']:
                 print("Strings Found:")
                 for s in section['strings']:
@@ -920,7 +922,7 @@ def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = Fa
     return result
 
 def main():
-    """Main function to parse command-line arguments and run the analysis."""
+    """Main function to parse arguments and run the analysis."""
     parser = argparse.ArgumentParser(
         description=(
             "Advanced MediaTek bootloader info extractor.\n"
@@ -943,6 +945,12 @@ def main():
         type=Path,
         default=Path.cwd() / 'output',
         help="Directory to save extracted files and outputs (default: ./output)"
+    )
+    parser.add_argument(
+        '--log-dir',
+        type=Path,
+        default=Path.home() / '.mtk_bootloader_analysis' / 'logs',
+        help="Directory to save log files (default: ~/.mtk_bootloader_analysis/logs)"
     )
     parser.add_argument(
         '--json',
@@ -971,8 +979,19 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.verbose:
-        logger.setLevel(logging.DEBUG)
+    global LOG_DIR
+    LOG_DIR = args.log_dir
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_FILE = LOG_DIR / f"mtk_bootloader_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(LOG_FILE, encoding='utf-8')
+        ]
+    )
 
     if not args.filename.is_file():
         logger.error(f"File not found: {args.filename}")
