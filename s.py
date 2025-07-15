@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Tuple, Dict, List, Optional, Any
 from collections import defaultdict
+import re
 
 # Attempt to import Capstone for disassembly
 try:
@@ -20,40 +21,51 @@ except ImportError:
     print("Warning: Capstone not installed. Disassembly unavailable. Install with: pip install capstone")
 
 # Setup logging
-log_dir = Path(os.getenv('LOCALAPPDATA', Path.home() / 'AppData' / 'Local')) / 'MTK_Bootloader_Analysis' / 'logs'
-log_dir.mkdir(parents=True, exist_ok=True)
-log_file = log_dir / f"MTK_Bootloader_Analysis_info_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+LOG_DIR = Path.home() / '.mtk_bootloader_analysis' / 'logs'
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / f"mtk_bootloader_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(log_file, encoding='utf-8')
+        logging.FileHandler(LOG_FILE, encoding='utf-8')
     ]
 )
 logger = logging.getLogger(__name__)
 
-# eMMC vendor dictionary
-EMMC_VENDORS = {
-    b'\x15\x01\x00': 'Samsung',
-    b'\x70\x01\x00': 'SK Hynix',
-    b'\x90\x01\x4A': 'Hynix',
-    b'\x45\x01\x00': 'Sandisk',
-    b'\xFE\x01\x4A': 'Micron',
-}
-
-# Known patterns to search for
-PATTERNS = {
-    'MTK_BLOADER_INFO': b'MTK_BLOADER_INFO',  # Keep original identifier for file parsing
-    'MTK_BIN': b'MTK_BIN',
-    'ARM_CODE_NOP': b'\x00\xF0\x20\xE3',  # ARM NOP
-    'STRING': lambda x: len(x) > 4 and all(32 <= c < 127 for c in x),
-    'POTENTIAL_PTR': lambda x: len(x) == 4 and 0x1000 <= int.from_bytes(x, 'little') <= 0x1FFFFF,
-}
+# Configuration class for constants
+class Config:
+    """Configuration for bootloader analysis."""
+    EMMC_VENDORS = {
+        b'\x15\x01\x00': 'Samsung',
+        b'\x70\x01\x00': 'SK Hynix',
+        b'\x90\x01\x4A': 'Hynix',
+        b'\x45\x01\x00': 'Sandisk',
+        b'\xFE\x01\x4A': 'Micron',
+    }
+    PATTERNS = {
+        'MTK_BLOADER_INFO': b'MTK_BLOADER_INFO',
+        'MTK_BIN': b'MTK_BIN',
+        'ARM_CODE_NOP': b'\x00\xF0\x20\xE3',
+        'STRING': lambda x: len(x) > 4 and all(32 <= c < 127 for c in x),
+        'POTENTIAL_PTR': lambda x: len(x) == 4 and 0x1000 <= int.from_bytes(x, 'little') <= 0x1FFFFF,
+    }
+    ELEMENT_SIZE = 188
+    HEADER_SIZE = 112
+    MAX_DRAM_SIZE_MB = 16384
+    MIN_FILE_SIZE = 128
 
 def decode_bytes(data: bytes) -> str:
-    """Decode bytes to ASCII string or return hex if not printable."""
+    """Decode bytes to ASCII string or return hex if not printable.
+
+    Args:
+        data: Bytes to decode.
+
+    Returns:
+        Decoded ASCII string or hex representation.
+    """
     try:
         ascii_str = data.split(b'\x00')[0].decode('ascii', errors='ignore').strip()
         if ascii_str and all(c.isprintable() for c in ascii_str):
@@ -63,12 +75,25 @@ def decode_bytes(data: bytes) -> str:
         return data.hex().upper()
 
 def decode_emmc_id(emmc_id: bytes, emmc_id_len: int) -> Dict[str, Any]:
-    """Decode eMMC ID with manufacturer info and additional details."""
+    """Decode eMMC ID with manufacturer info and additional details.
+
+    Args:
+        emmc_id: eMMC ID bytes.
+        emmc_id_len: Length of the eMMC ID.
+
+    Returns:
+        Dictionary with vendor, model, raw data, and details.
+    """
     if not 0 <= emmc_id_len <= 16:
-        return {'vendor': 'Not Available', 'model': '', 'raw': emmc_id.hex().upper(), 'details': {'error': f'Invalid length: {emmc_id_len}'}}
+        return {
+            'vendor': 'Not Available',
+            'model': '',
+            'raw': emmc_id.hex().upper(),
+            'details': {'error': f'Invalid length: {emmc_id_len}'}
+        }
     
     vendor_prefix = emmc_id[:3]
-    vendor = EMMC_VENDORS.get(vendor_prefix, 'Unknown')
+    vendor = Config.EMMC_VENDORS.get(vendor_prefix, 'Unknown')
     model_bytes = emmc_id[3:emmc_id_len]
     model_str = model_bytes.decode('ascii', errors='ignore').strip()
     model = model_str if all(c.isprintable() for c in model_str) else model_bytes.hex().upper()
@@ -86,7 +111,14 @@ def decode_emmc_id(emmc_id: bytes, emmc_id_len: int) -> Dict[str, Any]:
     }
 
 def interpret_dram_rank_size(rank_sizes: Tuple[int, ...]) -> List[str]:
-    """Interpret DRAM rank sizes into logical units."""
+    """Interpret DRAM rank sizes into logical units.
+
+    Args:
+        rank_sizes: Tuple of DRAM rank sizes in bytes.
+
+    Returns:
+        List of formatted size strings (e.g., "1 GB", "512 MB").
+    """
     sizes = []
     for size in rank_sizes:
         if size == 0:
@@ -97,7 +129,14 @@ def interpret_dram_rank_size(rank_sizes: Tuple[int, ...]) -> List[str]:
     return sizes
 
 def decode_dram_settings(element: Dict) -> Dict[str, Any]:
-    """Decode DRAM settings with detailed timing and configuration analysis."""
+    """Decode DRAM settings with detailed timing and configuration analysis.
+
+    Args:
+        element: Dictionary containing element data.
+
+    Returns:
+        Dictionary with EMI and ACTIM settings.
+    """
     emi_cona = element['emi_cona_val']
     actim = element['dramc_actim_val']
     
@@ -128,7 +167,15 @@ def decode_dram_settings(element: Dict) -> Dict[str, Any]:
     }
 
 def decode_reserved(reserved: bytes, file_size: int) -> Dict[str, Any]:
-    """Decode reserved field with advanced analysis and size checking."""
+    """Decode reserved field with advanced analysis and size checking.
+
+    Args:
+        reserved: Reserved field bytes.
+        file_size: Total file size for pointer validation.
+
+    Returns:
+        Dictionary with analysis of reserved field.
+    """
     decoded = {
         'hex': reserved.hex().upper(),
         'ints': [],
@@ -138,11 +185,11 @@ def decode_reserved(reserved: bytes, file_size: int) -> Dict[str, Any]:
         'entropy': sum(reserved.count(b) for b in set(reserved)) / len(reserved) if reserved else 0
     }
     
-    if len(reserved) < 40:
-        logger.warning(f"Reserved field shorter than expected ({len(reserved)} bytes), padding with zeros")
-        reserved_padded = reserved + b'\x00' * (40 - len(reserved))
+    if len(reserved) != 40:
+        logger.warning(f"Reserved field size mismatch ({len(reserved)} bytes), expected 40 bytes")
+        reserved_padded = reserved + b'\x00' * (40 - len(reserved)) if len(reserved) < 40 else reserved[:40]
     else:
-        reserved_padded = reserved[:40]
+        reserved_padded = reserved
     
     try:
         decoded['ints'] = list(struct.unpack('<10I', reserved_padded))
@@ -170,10 +217,23 @@ def decode_reserved(reserved: bytes, file_size: int) -> Dict[str, Any]:
     
     return decoded
 
-def disassemble_code(data: bytes, offset: int) -> Dict[str, Any]:
-    """Enhanced ARM disassembly with function detection and insights."""
+def disassemble_code(data: bytes, offset: int, max_instructions: int = 30) -> Dict[str, Any]:
+    """Disassemble ARM code with function detection and insights.
+
+    Args:
+        data: Bytes to disassemble.
+        offset: Starting offset for disassembly.
+        max_instructions: Maximum number of instructions to disassemble.
+
+    Returns:
+        Dictionary with disassembled instructions, functions, and insights.
+    """
     if not CAPSTONE_AVAILABLE:
-        return {'instructions': ["Disassembly unavailable (install capstone)"], 'functions': [], 'insights': []}
+        return {
+            'instructions': [f"Disassembly unavailable: Install capstone (pip install capstone)"],
+            'functions': [],
+            'insights': []
+        }
     
     try:
         modes = [(CS_MODE_ARM, "ARM"), (CS_MODE_THUMB, "Thumb")]
@@ -186,7 +246,7 @@ def disassemble_code(data: bytes, offset: int) -> Dict[str, Any]:
             branch_targets = set()
             
             for i, (address, size, mnemonic, op_str) in enumerate(md.disasm_lite(data, offset)):
-                if i >= 30:
+                if i >= max_instructions:
                     instructions.append("... (more instructions available)")
                     break
                 instr = f"0x{address:08X}: {mnemonic} {op_str}"
@@ -219,10 +279,31 @@ def disassemble_code(data: bytes, offset: int) -> Dict[str, Any]:
         
         return result
     except Exception as e:
-        return {'instructions': [f"Disassembly error: {e}"], 'functions': [], 'insights': []}
+        return {
+            'instructions': [f"Disassembly error: {e}"],
+            'functions': [],
+            'insights': []
+        }
 
 def extract_section(data: bytes, start: int, size: int, output_dir: Path, name: str, analyze: bool = False, file_size: int = 0) -> Dict[str, Any]:
-    """Extract a data section to a file with optional analysis."""
+    """Extract a data section to a file with optional analysis.
+
+    Args:
+        data: Full data buffer.
+        start: Start offset of the section.
+        size: Size of the section.
+        output_dir: Directory to save the extracted file.
+        name: Name of the section.
+        analyze: Whether to analyze the section (e.g., for strings or code).
+        file_size: Total file size for validation.
+
+    Returns:
+        Dictionary with section metadata and analysis.
+    """
+    if start + size > len(data):
+        logger.warning(f"Section {name} at 0x{start:X} exceeds file size, truncating to {len(data) - start} bytes")
+        size = len(data) - start
+    
     section = data[start:start + size]
     output_path = output_dir / f"{name}_{start:08X}_{size}.bin"
     with output_path.open('wb') as f:
@@ -231,34 +312,50 @@ def extract_section(data: bytes, start: int, size: int, output_dir: Path, name: 
     
     analysis = {'path': str(output_path), 'size': size}
     if analyze and size > 4:
-        analysis['strings'] = [s for s in section.decode('ascii', errors='ignore').split('\x00') if len(s) > 4 and all(c.isprintable() for c in s)]
-        disasm = disassemble_code(section, start)
-        analysis.update(disasm)
-        if name.startswith('ELEMENT'):
-            analysis['reserved'] = {}
-        else:
-            analysis['reserved'] = {}
+        analysis['strings'] = [s for s in re.findall(b'[\x20-\x7e]{5,}', section)]
+        analysis.update(disassemble_code(section, start))
+        analysis['reserved'] = {}
     return analysis
 
-def validate_element(element: Dict, offset: int) -> List[str]:
-    """Validate element data with improved context."""
+def validate_element(element: Dict, offset: int, file_size: int) -> List[str]:
+    """Validate element data with improved context.
+
+    Args:
+        element: Element dictionary to validate.
+        offset: Offset of the element in the file.
+        file_size: Total file size for validation.
+
+    Returns:
+        List of warning messages for invalid fields.
+    """
     warnings = []
     if not 0 <= element['emmc_id_len'] <= 16:
         warnings.append(f"Invalid eMMC ID length at offset 0x{offset:X}: {element['emmc_id_len']} (expected 0-16)")
     if not 0 <= element['fw_id_len'] <= 8:
         warnings.append(f"Invalid firmware ID length at offset 0x{offset:X}: {element['fw_id_len']} (expected 0-8)")
     total_mb = sum(size // (1024 * 1024) for size in element['dram_rank_size'])
-    if total_mb > 16384:
+    if total_mb > Config.MAX_DRAM_SIZE_MB:
         warnings.append(f"Unrealistic total DRAM size at offset 0x{offset:X}: {total_mb} MB")
     if element['type'] not in (0x203, 0) and not (0x100 <= element['type'] <= 0xFFFF):
         warnings.append(f"Unusual memory type at offset 0x{offset:X}: 0x{element['type']:X}")
+    if any(element['reserved']) and len(set(element['reserved'])) < 5:
+        warnings.append(f"Reserved field at offset 0x{offset:X} has low entropy, possible padding or corruption")
     return warnings
 
 def read_element(data: bytes, offset: int, file_size: int) -> Tuple[int, Dict]:
-    """Read a single element with corruption detection."""
+    """Read a single element with corruption detection.
+
+    Args:
+        data: Full data buffer.
+        offset: Starting offset of the element.
+        file_size: Total file size for validation.
+
+    Returns:
+        Tuple of (new offset, element dictionary).
+    """
     try:
-        if offset + 188 > len(data):
-            raise ValueError("Insufficient data for complete element")
+        if offset + Config.ELEMENT_SIZE > len(data):
+            raise ValueError(f"Insufficient data for element at 0x{offset:X} (need {Config.ELEMENT_SIZE} bytes)")
         
         cur_pos = offset
         element = {'_offset': offset}
@@ -274,7 +371,7 @@ def read_element(data: bytes, offset: int, file_size: int) -> Tuple[int, Dict]:
         element['dramc_gddr3ctl1_val'], element['dramc_conf1_val'], element['dramc_ddr2ctl_val'], element['dramc_test2_3_val'], \
         element['dramc_conf2_val'], element['dramc_pd_ctrl_val'], element['dramc_padctl3_val'], element['dramc_dqodly_val'], \
         element['dramc_addr_output_dly'], element['dramc_clk_output_dly'], element['dramc_actim1_val'], element['dramc_misctl0_val'], \
-        element['dramc_actim05t_val'] = dram_fields[:17]
+        element['dramc_actim05t_val'] = dram_fields
         cur_pos += 68
         element['dram_rank_size'] = struct.unpack_from('<4I', data, cur_pos)
         cur_pos += 16
@@ -291,11 +388,22 @@ def read_element(data: bytes, offset: int, file_size: int) -> Tuple[int, Dict]:
         return cur_pos, element
     except (struct.error, ValueError) as e:
         logger.error(f"Failed to parse element at offset 0x{offset:X}: {e}")
-        element = {'_offset': offset, 'raw_data': data[offset:min(offset + 188, len(data))].hex().upper()}
-        return offset + 188, element
+        element = {'_offset': offset, 'raw_data': data[offset:min(offset + Config.ELEMENT_SIZE, len(data))].hex().upper()}
+        return offset + Config.ELEMENT_SIZE, element
 
 def print_element(element: Dict, print_type: str, csv_writer: Optional[csv.writer] = None, summary: bool = False, file_size: int = 0) -> Dict[str, Any]:
-    """Print or save element data with enhanced analysis."""
+    """Print or save element data with enhanced analysis.
+
+    Args:
+        element: Element dictionary to print or save.
+        print_type: Output format ('normal' or 'excel').
+        csv_writer: CSV writer object for excel output.
+        summary: Whether to print a concise summary.
+        file_size: Total file size for analysis.
+
+    Returns:
+        Dictionary with element analysis.
+    """
     if 'raw_data' in element:
         analysis = {
             'offset': f"0x{element['_offset']:X}",
@@ -331,7 +439,7 @@ def print_element(element: Dict, print_type: str, csv_writer: Optional[csv.write
         'recommendations': []
     }
     
-    if total_dram_mb > 16384:
+    if total_dram_mb > Config.MAX_DRAM_SIZE_MB:
         analysis['recommendations'].append("Unrealistic DRAM size detected. Verify units or corruption.")
     if reserved_info['potential_pointers']:
         analysis['recommendations'].append("Potential pointers found in reserved field. Cross-reference with file offsets.")
@@ -408,10 +516,15 @@ def print_element(element: Dict, print_type: str, csv_writer: Optional[csv.write
     return analysis
 
 def generate_flash_tool_config(elements: List[Dict], output_dir: Path) -> None:
-    """Generate an enhanced SP Flash Tool memory config file."""
+    """Generate an SP Flash Tool memory config file.
+
+    Args:
+        elements: List of element analysis dictionaries.
+        output_dir: Directory to save the config file.
+    """
     config = [
         "# SP Flash Tool Memory Configuration",
-        "# Generated by MTK_Bootloader_Analysis",
+        f"# Generated by MTK Bootloader Analysis ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})",
         ""
     ]
     for i, element in enumerate(elements):
@@ -432,8 +545,23 @@ def generate_flash_tool_config(elements: List[Dict], output_dir: Path) -> None:
         f.write("\n".join(config))
     logger.info(f"Generated SP Flash Tool config at {config_path}")
 
-def analyze_remaining_data(data: bytes, start: int, output_dir: Path, file_size: int) -> Dict[str, Any]:
-    """Enhanced analysis of remaining data."""
+def analyze_remaining_data(data: bytes, start: int, output_dir: Path, file_size: int, max_size: int = 1024*1024) -> Dict[str, Any]:
+    """Analyze remaining data for strings, code, and pointers.
+
+    Args:
+        data: Remaining data buffer.
+        start: Starting offset of the remaining data.
+        output_dir: Directory to save extracted sections.
+        file_size: Total file size for validation.
+        max_size: Maximum size to analyze to prevent performance issues.
+
+    Returns:
+        Dictionary with analysis results.
+    """
+    if len(data) > max_size:
+        logger.warning(f"Remaining data size ({len(data)} bytes) exceeds analysis limit ({max_size} bytes), truncating")
+        data = data[:max_size]
+    
     analysis = {
         'offset': f"0x{start:X}",
         'size': len(data),
@@ -444,21 +572,17 @@ def analyze_remaining_data(data: bytes, start: int, output_dir: Path, file_size:
         'entropy': sum(data.count(b) for b in set(data)) / len(data) if data else 0
     }
     
-    current_str = ""
-    for i in range(len(data)):
-        char = data[i]
-        if 32 <= char < 127:
-            current_str += chr(char)
-        elif current_str:
-            if len(current_str) > 4:
-                analysis['strings'].append(f"0x{start + i - len(current_str):X}: {current_str}")
-            current_str = ""
+    # String detection using regex for efficiency
+    analysis['strings'] = [f"0x{start + m.start():X}: {m.group().decode('ascii')}"
+                          for m in re.finditer(b'[\x20-\x7e]{5,}', data)]
     
+    # Pointer detection
     for i in range(0, len(data) - 3, 4):
         val = struct.unpack_from('<I', data, i)[0]
         if 0x1000 <= val < file_size:
             analysis['pointers'].append(f"0x{start + i:X}: 0x{val:08X}")
     
+    # Code detection
     if CAPSTONE_AVAILABLE:
         md = Cs(CS_ARCH_ARM, CS_MODE_ARM)
         code_start = None
@@ -506,7 +630,12 @@ def analyze_remaining_data(data: bytes, start: int, output_dir: Path, file_size:
     return analysis
 
 def export_markdown(result: Dict, output_dir: Path) -> None:
-    """Export detailed analysis to Markdown."""
+    """Export detailed analysis to Markdown.
+
+    Args:
+        result: Analysis result dictionary.
+        output_dir: Directory to save the Markdown file.
+    """
     md_lines = [
         "# MTK Bootloader Analysis",
         f"**Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -555,8 +684,24 @@ def export_markdown(result: Dict, output_dir: Path) -> None:
     logger.info(f"Exported Markdown report to {md_path}")
 
 def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = False, summary: bool = False, markdown: bool = False) -> Dict[str, Any]:
-    """Parse the entire preloader file with maximum extraction."""
+    """Parse the entire preloader file with maximum extraction.
+
+    Args:
+        data: Bootloader file data.
+        print_type: Output format ('normal' or 'excel').
+        output_dir: Directory to save extracted files and outputs.
+        json_output: Whether to save analysis as JSON.
+        summary: Whether to print a concise summary.
+        markdown: Whether to export analysis as Markdown.
+
+    Returns:
+        Dictionary with complete analysis results.
+    """
     file_size = len(data)
+    if file_size < Config.MIN_FILE_SIZE:
+        logger.error(f"File too small to contain meaningful data ({file_size} bytes)")
+        return {'file_size': file_size, 'header': {}, 'elements': [], 'additional_sections': [], 'analysis': {}}
+    
     result = {
         'file_size': file_size,
         'header': {},
@@ -574,7 +719,8 @@ def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = Fa
     
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    for name, pattern in PATTERNS.items():
+    # Pattern search
+    for name, pattern in Config.PATTERNS.items():
         if isinstance(pattern, bytes):
             pos = -1
             while True:
@@ -582,17 +728,22 @@ def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = Fa
                 if pos == -1:
                     break
                 result['analysis']['patterns_found'][name].append(f"0x{pos:X}")
-                extract_section(data, pos, len(pattern), output_dir, name, file_size=file_size)
+                result['additional_sections'].append(extract_section(data, pos, len(pattern), output_dir, name, file_size=file_size))
         elif callable(pattern):
             for i in range(0, len(data) - 16, 4):
                 chunk = data[i:i+16]
                 if pattern(chunk):
                     result['analysis']['patterns_found'][name].append(f"0x{i:X}")
     
+    # Header parsing
     header_pos = data.find(b"MTK_BLOADER_INFO")
     if header_pos == -1:
         logger.warning("MTK_BLOADER_INFO not found, proceeding with raw analysis")
         result['additional_sections'].append(analyze_remaining_data(data, 0, output_dir, file_size))
+        return result
+    
+    if header_pos + Config.HEADER_SIZE > len(data):
+        logger.error(f"Header at 0x{header_pos:X} exceeds file size")
         return result
     
     cur_pos = header_pos
@@ -600,12 +751,16 @@ def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = Fa
     cur_pos += 27
     pre_bin = decode_bytes(data[cur_pos:cur_pos+61])
     cur_pos += 61
-    hex_1, hex_2, hex_3 = struct.unpack_from('<3I', data, cur_pos)
-    cur_pos += 12
-    mtk_bin = decode_bytes(data[cur_pos:cur_pos+8])
-    cur_pos += 8
-    total_custem_chips, = struct.unpack_from('<I', data, cur_pos)
-    cur_pos += 4
+    try:
+        hex_1, hex_2, hex_3 = struct.unpack_from('<3I', data, cur_pos)
+        cur_pos += 12
+        mtk_bin = decode_bytes(data[cur_pos:cur_pos+8])
+        cur_pos += 8
+        total_custem_chips, = struct.unpack_from('<I', data, cur_pos)
+        cur_pos += 4
+    except struct.error as e:
+        logger.error(f"Failed to parse header at 0x{header_pos:X}: {e}")
+        return result
     
     result['header'] = {
         'header': header,
@@ -633,11 +788,12 @@ def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = Fa
     header_size = cur_pos - header_pos
     result['additional_sections'].append(extract_section(data, header_pos, header_size, output_dir, "MTK_BLOADER_INFO_HEADER", analyze=True, file_size=file_size))
     
+    # CSV setup
     csv_file = None
     csv_writer = None
     if print_type == 'excel':
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_path = output_dir / f"MTK_Bootloader_Analysis_info_{timestamp}.csv"
+        csv_path = output_dir / f"mtk_bootloader_analysis_{timestamp}.csv"
         csv_file = csv_path.open('w', newline='', encoding='utf-8-sig')
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
@@ -655,12 +811,15 @@ def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = Fa
     
     result['analysis']['total_elements'] = total_custem_chips
     for i in range(total_custem_chips):
+        if cur_pos + Config.ELEMENT_SIZE > len(data):
+            logger.warning(f"Element {i} at 0x{cur_pos:X} exceeds file size, stopping element parsing")
+            break
         if not json_output and not summary:
             print(f"--------Start Element {i}--------")
         logger.debug(f"Parsing element {i} at offset 0x{cur_pos:X}")
         start_pos = cur_pos
         cur_pos, element = read_element(data, cur_pos, file_size)
-        warnings = validate_element(element, start_pos)
+        warnings = validate_element(element, start_pos, file_size)
         for w in warnings:
             logger.warning(w)
         element_analysis = print_element(element, print_type, csv_writer, summary, file_size)
@@ -676,12 +835,15 @@ def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = Fa
         result['additional_sections'].append(extract_section(data, start_pos, cur_pos - start_pos, output_dir, f"ELEMENT_{i}", analyze=True, file_size=file_size))
     
     if cur_pos + 4 <= len(data):
-        size, = struct.unpack_from('<I', data, cur_pos)
-        result['size'] = size
-        if not json_output and not summary:
-            print(f"Size: {size}")
-        result['additional_sections'].append(extract_section(data, cur_pos, 4, output_dir, "SIZE_FIELD", analyze=False, file_size=file_size))
-        cur_pos += 4
+        try:
+            size, = struct.unpack_from('<I', data, cur_pos)
+            result['size'] = size
+            if not json_output and not summary:
+                print(f"Size: {size}")
+            result['additional_sections'].append(extract_section(data, cur_pos, 4, output_dir, "SIZE_FIELD", analyze=False, file_size=file_size))
+            cur_pos += 4
+        except struct.error as e:
+            logger.error(f"Failed to parse size field at 0x{cur_pos:X}: {e}")
     
     if cur_pos < len(data):
         remaining_size = len(data) - cur_pos
@@ -758,10 +920,13 @@ def parse(data: bytes, print_type: str, output_dir: Path, json_output: bool = Fa
     return result
 
 def main():
+    """Main function to parse command-line arguments and run the analysis."""
     parser = argparse.ArgumentParser(
         description=(
             "Advanced MediaTek bootloader info extractor.\n"
-            "Extracts all possible data with deep analysis for reverse engineering and firmware development."
+            "Extracts detailed information about eMMC, DRAM, firmware, and other sections from MediaTek bootloader files.\n"
+            "Supports CSV, JSON, and Markdown output formats for analysis.\n"
+            "Example: python mtk_bootloader_analysis.py --excel --json --markdown preloader.bin"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -771,7 +936,7 @@ def main():
         const='excel',
         dest='print_type',
         default='normal',
-        help="Output in tab-separated format (enables CSV export)"
+        help="Output in tab-separated CSV format"
     )
     parser.add_argument(
         '--output-dir',
@@ -802,7 +967,7 @@ def main():
     parser.add_argument(
         'filename',
         type=Path,
-        help="Path to bootloader file (e.g., C:\\path\\to\\preloader.bin)"
+        help="Path to bootloader file (e.g., ./preloader.bin)"
     )
     args = parser.parse_args()
 
@@ -812,9 +977,10 @@ def main():
     if not args.filename.is_file():
         logger.error(f"File not found: {args.filename}")
         sys.exit(1)
+    
     file_size = args.filename.stat().st_size
-    if file_size < 128:
-        logger.error(f"File too small to contain meaningful data: {args.filename}")
+    if file_size < Config.MIN_FILE_SIZE:
+        logger.error(f"File too small to contain meaningful data: {args.filename} ({file_size} bytes)")
         sys.exit(1)
 
     logger.info(f"Processing bootloader \"{args.filename}\" ({file_size} bytes)")
